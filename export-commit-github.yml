@@ -1,0 +1,245 @@
+name: export-and-commit-solution
+
+run-name: ${{ inputs.environment }} Export Solution ${{ inputs.solution_name }} by @${{ github.actor }} from ${{ inputs.track_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        required: true
+        default: Machining.dev
+        options:
+          - Development
+          - Machining.dev
+          - Seco Dev
+
+      track_name:
+        type: choice
+        required: true
+        options:
+          - Sales Enablemenent
+          - Platform Enablement
+          - Customer Support
+          - Digital Channels
+
+      solution_name:
+        required: true
+
+      solution_type:
+        type: choice
+        required: true
+        default: both
+        options:
+          - unmanaged
+          - managed
+          - both
+
+permissions:
+  contents: write
+
+jobs:
+  export-from-dev:
+    runs-on: windows-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Power Platform Action Install
+        uses: microsoft/powerplatform-actions/actions-install@v1
+
+      - name: Export Temp Solution for Checker
+        id: export_temp
+        uses: microsoft/powerplatform-actions/export-solution@v1
+        with:
+          environment-url: ${{ vars.ENVIRONMENT_URL }}
+          app-id: ${{ vars.CLIENT_ID }}
+          client-secret: ${{ secrets.CLIENT_SECRET }}
+          tenant-id: ${{ vars.TENANT_ID }}
+          solution-name: ${{ github.event.inputs.solution_name }}
+          solution-output-file: temp_solution.zip
+          managed: false
+          overwrite: true
+
+      - name: Run Solution Checker
+        id: solution_checker
+        continue-on-error: true
+        uses: microsoft/powerplatform-actions/check-solution@v1
+        with:
+          environment-url: ${{ vars.ENVIRONMENT_URL }}
+          app-id: ${{ vars.CLIENT_ID }}
+          client-secret: ${{ secrets.CLIENT_SECRET }}
+          tenant-id: ${{ vars.TENANT_ID }}
+          path: temp_solution.zip
+          fail-on-analysis-error: false
+          checker-logs-artifact-name: checker-results
+
+      - name: Download Checker Results Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: checker-results
+          path: checker-output
+
+      - name: Parse Solution Checker Results
+        id: parse_checker
+        shell: pwsh
+        run: |
+          $sarifFile = Get-ChildItem "checker-output" -Recurse -Filter *.sarif | Select-Object -First 1
+
+          if (-not $sarifFile) {
+            echo "critical=0" >> $env:GITHUB_OUTPUT
+            echo "high=0" >> $env:GITHUB_OUTPUT
+            echo "medium=0" >> $env:GITHUB_OUTPUT
+            echo "low=0" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          $content = Get-Content $sarifFile.FullName -Raw | ConvertFrom-Json
+
+          $critical = 0
+          $high = 0
+          $medium = 0
+          $low = 0
+
+          foreach ($run in $content.runs) {
+            foreach ($result in $run.results) {
+
+              $severity = $null
+
+              if ($result.properties -and $result.properties.severity) {
+                $severity = $result.properties.severity
+              }
+              elseif ($result.properties -and $result.properties.ruleSeverity) {
+                $severity = $result.properties.ruleSeverity
+              }
+              elseif ($result.level) {
+                $severity = $result.level
+              }
+
+              if ($severity) {
+                switch ($severity.ToString().ToLower()) {
+                  "critical" { $critical++ }
+                  "high"     { $high++ }
+                  "medium"   { $medium++ }
+                  "low"      { $low++ }
+
+                  "error"    { $high++ }
+                  "warning"  { $medium++ }
+                  "note"     { $low++ }
+                }
+              }
+            }
+          }
+
+          echo "critical=$critical" >> $env:GITHUB_OUTPUT
+          echo "high=$high" >> $env:GITHUB_OUTPUT
+          echo "medium=$medium" >> $env:GITHUB_OUTPUT
+          echo "low=$low" >> $env:GITHUB_OUTPUT
+
+      - name: Export unmanaged solution
+        if: ${{ github.event.inputs.solution_type == 'unmanaged' || github.event.inputs.solution_type == 'both' }}
+        id: export_unmanaged
+        continue-on-error: true
+        uses: microsoft/powerplatform-actions/export-solution@v1
+        with:
+          environment-url: ${{ vars.ENVIRONMENT_URL }}
+          app-id: ${{ vars.CLIENT_ID }}
+          client-secret: ${{ secrets.CLIENT_SECRET }}
+          tenant-id: ${{ vars.TENANT_ID }}
+          solution-name: ${{ github.event.inputs.solution_name }}
+          solution-output-file: ${{ github.event.repository.name }}/${{ vars.SOLUTION_VERSION }}/${{ github.event.inputs.solution_name }}_unmanaged.zip
+          managed: false
+          overwrite: true
+          max-async-wait-time: 60
+
+      - name: Export managed solution
+        if: ${{ github.event.inputs.solution_type == 'managed' || github.event.inputs.solution_type == 'both' }}
+        id: export_managed
+        continue-on-error: true
+        uses: microsoft/powerplatform-actions/export-solution@v1
+        with:
+          environment-url: ${{ vars.ENVIRONMENT_URL }}
+          app-id: ${{ vars.CLIENT_ID }}
+          client-secret: ${{ secrets.CLIENT_SECRET }}
+          tenant-id: ${{ vars.TENANT_ID }}
+          solution-name: ${{ github.event.inputs.solution_name }}
+          solution-output-file: ${{ github.event.repository.name }}/${{ vars.SOLUTION_VERSION }}/${{ github.event.inputs.solution_name }}_managed.zip
+          managed: true
+          overwrite: true
+          max-async-wait-time: 60
+
+      - name: Fail if export failed
+        if: steps.export_unmanaged.outcome == 'failure' || steps.export_managed.outcome == 'failure'
+        run: |
+          echo "Export failed"
+          exit 1
+
+      - name: Git Fetch and Commit
+        shell: pwsh
+        run: |
+          git fetch --all
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git checkout Releases
+          git pull origin Releases
+          git add --all
+          git commit -m "Export solution ${{ github.event.inputs.solution_name }}" || echo "No changes"
+          git push
+      
+      - name: Send Teams Notification
+        if: always()
+        shell: pwsh
+        run: |
+          $status = "${{ job.status }}"
+          $solution = "${{ github.event.inputs.solution_name }}"
+          $environment = "${{ github.event.inputs.environment }}"
+          $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          $actor = "${{ github.actor }}"
+
+          $critical = "${{ steps.parse_checker.outputs.critical }}"
+          $high = "${{ steps.parse_checker.outputs.high }}"
+          $medium = "${{ steps.parse_checker.outputs.medium }}"
+          $low = "${{ steps.parse_checker.outputs.low }}"
+          $checkerStatus = "${{ steps.solution_checker.outcome }}"
+
+          if ($status -eq "success") {
+            $result = "EXPORT SUCCESS"
+            $failureReason = "N/A"
+          }
+          else {
+            $result = "EXPORT FAILED"
+            if ("${{ steps.export_unmanaged.outcome }}" -eq "failure") {
+              $failureReason = "Unmanaged solution export failed"
+            }
+            elseif ("${{ steps.export_managed.outcome }}" -eq "failure") {
+              $failureReason = "Managed solution export failed"
+            }
+            else {
+              $failureReason = "Export process failed"
+            }
+          }
+
+          $body = @{
+            title = $result
+            solution = $solution
+            environment = $environment
+            triggeredBy = $actor
+            status = $status
+
+            checkerStatus = $checkerStatus
+            critical = $critical
+            highIssues = $high
+            mediumIssues = $medium
+            lowIssues = $low
+
+            failureReason = $failureReason
+            runUrl = $runUrl
+          } | ConvertTo-Json -Depth 5
+
+          Invoke-RestMethod -Method Post `
+            -Uri "${{ secrets.TEAMS_WEBHOOK_URL }}" `
+            -ContentType "application/json" `
+            -Body $body
