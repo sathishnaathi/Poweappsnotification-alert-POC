@@ -1,0 +1,106 @@
+name: Import Managed Solution
+
+run-name: "[${{ inputs.environment }}] Managed import: ${{ inputs.solution_name }} by @${{ github.actor }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: Select the target environment
+        required: true
+        options:
+          - Machining Sandbox
+          - Machining Playground
+          - Seco Dev
+          - Seco QA
+          - Seco UAT
+          - Seco Training
+          - Seco Prod
+          - Machining.dev
+
+      solution_name:
+        description: Solution Unique Name (Patch Id)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  Notify-Environment-approval:
+    runs-on: windows-latest
+    if: contains('Seco Prod,Seco Training,Seco UAT,Seco QA,Seco Dev', github.event.inputs.environment)
+    steps:
+      - name: Send Approval Notification to Teams
+        shell: pwsh
+        run: |
+          $solution = "${{ github.event.inputs.solution_name }}"
+          $environment = "${{ github.event.inputs.environment }}"
+          $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          $actor = "${{ github.actor }}"
+          $body = @{
+            title = "APPROVAL REQUIRED"
+            solution = $solution
+            environment = $environment
+            triggeredBy = $actor
+            status = "Waiting for approval"
+            runUrl = $runUrl
+          } | ConvertTo-Json -Depth 5
+          Invoke-RestMethod -Method Post `
+            -Uri "${{ secrets.TEAMS_WEBHOOK_URL }}" `
+            -ContentType "application/json" `
+            -Body $body
+
+  import-managed-solution:
+    needs: Notify-Environment-approval
+    runs-on: windows-latest
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      GITHUB_BRANCH: ${{ github.ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - name: Power Platform Action Install
+        uses: microsoft/powerplatform-actions/actions-install@v1
+
+      - name: Import managed solution to target environment
+        uses: microsoft/powerplatform-actions/import-solution@v1
+        with:
+          environment-url: ${{ vars.ENVIRONMENT_URL }}
+          app-id: ${{ vars.CLIENT_ID }}
+          client-secret: ${{ secrets.CLIENT_SECRET }}
+          tenant-id: ${{ vars.TENANT_ID }}
+          solution-file: ${{ github.event.repository.name }}/${{ vars.SOLUTION_VERSION }}/${{ github.event.inputs.solution_name }}_managed.zip
+          force-overwrite: true
+          publish-changes: true
+          max-async-wait-time: 90
+          activate-plugins: true
+          run-asynchronously: true
+
+      - name: Send Final Teams Notification
+        if: always()
+        shell: pwsh
+        run: |
+          $status = "${{ job.status }}"
+          if ($status -eq "success") {
+            $result = "IMPORT SUCCESS"
+          } else {
+            $result = "IMPORT FAILED"
+          }
+          $solution = "${{ github.event.inputs.solution_name }}"
+          $environment = "${{ github.event.inputs.environment }}"
+          $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          $actor = "${{ github.actor }}"
+          $body = @{
+            title = $result
+            solution = $solution
+            environment = $environment
+            triggeredBy = $actor
+            status = $status
+            runUrl = $runUrl
+          } | ConvertTo-Json -Depth 5
+          Invoke-RestMethod -Method Post `
+            -Uri "${{ secrets.TEAMS_WEBHOOK_URL }}" `
+            -ContentType "application/json" `
+            -Body $body
